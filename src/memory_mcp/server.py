@@ -1,15 +1,10 @@
 """Memory MCP Server — persistent knowledge graph with SQLite backend.
 
 Replaces the off-the-shelf mcp-server-memory (npm) with a Python implementation
-that adds timestamps, graph traversal, fuzzy search, and temporal queries while
-maintaining backward compatibility with the JSONL file format.
+that adds timestamps, graph traversal, fuzzy search, and temporal queries.
 
 Storage:
-  SQLite  at MEMORY_DB_PATH   (default: ~/.vibe/memory.db)  — primary store
-  JSONL   at MEMORY_FILE_PATH (default: ~/.vibe/memory.jsonl) — derived export
-
-On first startup, imports existing JSONL into SQLite. JSONL is atomically
-rebuilt from SQLite on every mutation — no incremental appends, no divergence.
+  SQLite  at MEMORY_DB_PATH (default: ~/.vibe/memory.db) — primary store
 """
 import json
 import os
@@ -26,7 +21,6 @@ from mcp.server.fastmcp import FastMCP
 # ---------------------------------------------------------------------------
 
 DB_PATH = Path(os.environ.get("MEMORY_DB_PATH", Path.home() / ".vibe" / "memory.db"))
-JSONL_PATH = Path(os.environ.get("MEMORY_FILE_PATH", Path.home() / ".vibe" / "memory.jsonl"))
 
 mcp = FastMCP(
     "memory",
@@ -60,7 +54,6 @@ def _get_conn() -> sqlite3.Connection:
                 _conn.execute("PRAGMA foreign_keys=ON")
                 _conn.row_factory = sqlite3.Row
                 _init_schema()
-                _maybe_migrate_from_jsonl()
     return _conn
 
 
@@ -98,112 +91,6 @@ def _init_schema() -> None:
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-# ---------------------------------------------------------------------------
-# JSONL — derived export only, atomically rebuilt on every mutation
-# ---------------------------------------------------------------------------
-
-def _maybe_migrate_from_jsonl() -> None:
-    """Import existing JSONL into SQLite if the database is empty."""
-    conn = _get_conn()
-    count = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
-    if count > 0 or not JSONL_PATH.exists():
-        return
-
-    entities_seen: set[str] = set()
-    skipped = 0
-    for line in _read_jsonl_raw():
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            skipped += 1
-            continue
-        if not isinstance(item, dict):
-            skipped += 1
-            continue
-
-        if item.get("type") == "entity":
-            try:
-                name = item["name"]
-            except KeyError:
-                skipped += 1
-                continue
-            if name in entities_seen:
-                for obs in item.get("observations", []):
-                    if isinstance(obs, str):
-                        conn.execute(
-                            "INSERT INTO observations (entity_id, content, created_at) "
-                            "SELECT id, ?, ? FROM entities WHERE name = ?",
-                            (obs, _now(), name),
-                        )
-                continue
-            entities_seen.add(name)
-            conn.execute(
-                "INSERT INTO entities (name, entity_type, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                (name, item.get("entityType", "unknown"), _now(), _now()),
-            )
-            for obs in item.get("observations", []):
-                if isinstance(obs, str):
-                    conn.execute(
-                        "INSERT INTO observations (entity_id, content, created_at) "
-                        "SELECT id, ?, ? FROM entities WHERE name = ?",
-                        (obs, _now(), name),
-                    )
-        elif item.get("type") == "relation":
-            try:
-                conn.execute(
-                    "INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type, created_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (item["from"], item["to"], item.get("relationType", "related_to"), _now()),
-                )
-            except (KeyError, sqlite3.IntegrityError):
-                skipped += 1
-    conn.commit()
-
-
-def _read_jsonl_raw() -> list[str]:
-    """Read non-empty lines from the JSONL file. Uses strict encoding."""
-    if not JSONL_PATH.exists():
-        return []
-    try:
-        text = JSONL_PATH.read_text(encoding="utf-8", errors="strict")
-        return [ln.strip() for ln in text.splitlines() if ln.strip()]
-    except (OSError, UnicodeDecodeError):
-        return []
-
-
-def _rebuild_jsonl() -> None:
-    """Atomically rebuild the JSONL file from SQLite (temp file + rename)."""
-    conn = _get_conn()
-    entries: list[dict] = []
-
-    # Select entity id so we can join directly, avoiding duplicate-name ambiguity
-    for row in conn.execute("SELECT id, name, entity_type FROM entities ORDER BY id"):
-        obs_rows = conn.execute(
-            "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
-            (row["id"],),
-        ).fetchall()
-        entries.append({
-            "type": "entity",
-            "name": row["name"],
-            "entityType": row["entity_type"],
-            "observations": [o["content"] for o in obs_rows],
-        })
-
-    for row in conn.execute("SELECT from_entity, to_entity, relation_type FROM relations ORDER BY id"):
-        entries.append({
-            "type": "relation",
-            "from": row["from_entity"],
-            "to": row["to_entity"],
-            "relationType": row["relation_type"],
-        })
-
-    content = "\n".join(json.dumps(e, ensure_ascii=False) for e in entries) + "\n"
-    tmp_path = JSONL_PATH.with_suffix(".jsonl.tmp")
-    JSONL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path.write_text(content, encoding="utf-8")
-    os.replace(tmp_path, JSONL_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -289,8 +176,6 @@ def create_entities(entities: list[dict]) -> str:
             errors.append(f"Entity already exists: {name}")
 
     conn.commit()
-    if created > 0:
-        _rebuild_jsonl()
     msg = f"Created {created} entities."
     if errors:
         msg += f" Errors: {'; '.join(errors)}"
@@ -330,8 +215,6 @@ def create_relations(relations: list[dict]) -> str:
             errors.append(f"Relation already exists: {from_e} -> {to_e} ({rtype})")
 
     conn.commit()
-    if created > 0:
-        _rebuild_jsonl()
     msg = f"Created {created} relations."
     if errors:
         msg += f" Errors: {'; '.join(errors)}"
@@ -373,8 +256,6 @@ def add_observations(observations: list[dict]) -> str:
         conn.execute("UPDATE entities SET updated_at = ? WHERE id = ?", (now, entity_id))
 
     conn.commit()
-    if added > 0:
-        _rebuild_jsonl()
 
     msg = f"Added {added} observations."
     if errors:
@@ -395,8 +276,6 @@ def delete_entities(entityNames: list[str]) -> str:
         deleted += cursor.rowcount
 
     conn.commit()
-    if deleted > 0:
-        _rebuild_jsonl()
     return f"Deleted {deleted} entities."
 
 
@@ -431,8 +310,6 @@ def delete_observations(deletions: list[dict]) -> str:
             deleted += cursor.rowcount
 
     conn.commit()
-    if deleted > 0:
-        _rebuild_jsonl()
     msg = f"Deleted {deleted} observations."
     if errors:
         msg += f" Errors: {'; '.join(errors)}"
@@ -467,8 +344,6 @@ def delete_relations(relations: list[dict]) -> str:
         deleted += cursor.rowcount
 
     conn.commit()
-    if deleted > 0:
-        _rebuild_jsonl()
     return f"Deleted {deleted} relations."
 
 
