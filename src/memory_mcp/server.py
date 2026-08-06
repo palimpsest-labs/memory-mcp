@@ -6,7 +6,6 @@ that adds timestamps, graph traversal, fuzzy search, and temporal queries.
 Storage:
   SQLite  at MEMORY_DB_PATH (default: ~/.vibe/memory.db) — primary store
 """
-import json
 import os
 import re
 import sqlite3
@@ -15,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import TextContent
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -133,6 +133,74 @@ def _get_obs_by_entity_id(conn: sqlite3.Connection, entity_id: int) -> list[str]
         (entity_id,),
     ).fetchall()
     return [r["content"] for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Content-block renderers
+#
+# Read tools return their results as a list of TextContent blocks rather than a
+# single JSON-encoded string. Each observation is emitted as its own block
+# ("Observation: …"), matching the reference mcp-server-memory behaviour, so
+# agents receive discrete observations instead of one opaque string.
+# ---------------------------------------------------------------------------
+
+def _entity_blocks(
+    name: str,
+    entity_type: str,
+    observations: list[str],
+    created_at: str | None = None,
+    updated_at: str | None = None,
+) -> list[TextContent]:
+    blocks = [
+        TextContent(type="text", text=f"Name: {name}"),
+        TextContent(type="text", text=f"Type: {entity_type}"),
+    ]
+    blocks.extend(
+        TextContent(type="text", text=f"Observation: {obs}") for obs in observations
+    )
+    if created_at:
+        blocks.append(TextContent(type="text", text=f"Created: {created_at}"))
+    if updated_at:
+        blocks.append(TextContent(type="text", text=f"Updated: {updated_at}"))
+    return blocks
+
+
+def _relation_blocks(relations: list[dict]) -> list[TextContent]:
+    blocks: list[TextContent] = []
+    for r in relations:
+        blocks.append(
+            TextContent(
+                type="text",
+                text=f"Relation: {r['from']} -> {r['to']} ({r['relationType']})",
+            )
+        )
+        if r.get("created_at"):
+            blocks.append(
+                TextContent(type="text", text=f"Relation created: {r['created_at']}")
+            )
+    return blocks
+
+
+def _join_entities(entities: list[dict]) -> list[TextContent]:
+    """Render a list of entity dicts, inserting a separator between entities.
+
+    Each entity dict may carry optional created_at/updated_at keys (e.g. from
+    ``recent``/``open_nodes``); they are rendered when present.
+    """
+    blocks: list[TextContent] = []
+    for i, e in enumerate(entities):
+        if i:
+            blocks.append(TextContent(type="text", text="---"))
+        blocks.extend(
+            _entity_blocks(
+                e["name"],
+                e["entityType"],
+                e["observations"],
+                created_at=e.get("created_at"),
+                updated_at=e.get("updated_at"),
+            )
+        )
+    return blocks
 
 
 # ---------------------------------------------------------------------------
@@ -352,17 +420,17 @@ def delete_relations(relations: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def search_nodes(query: str) -> str:
+def search_nodes(query: str) -> list[TextContent]:
     """Search for nodes in the knowledge graph.
 
     Case-insensitive token match across entity names, types, and observation content.
-    Returns matching entities with their observations.
+    Returns matching entities with their observations as discrete content blocks.
     """
     conn = _get_conn()
     tokens = query.lower().split()
 
     if not tokens:
-        return json.dumps({"entities": [], "relations": []})
+        return [TextContent(type="text", text="No entities found.")]
 
     conditions = []
     params: list[str] = []
@@ -382,7 +450,7 @@ def search_nodes(query: str) -> str:
     ).fetchall()
 
     if not rows:
-        return json.dumps({"entities": [], "relations": []})
+        return [TextContent(type="text", text="No entities found.")]
 
     result_entities = []
     result_relations = []
@@ -411,17 +479,20 @@ def search_nodes(query: str) -> str:
                 "relationType": rel["relation_type"],
             })
 
-    return json.dumps({"entities": result_entities, "relations": result_relations})
+    blocks: list[TextContent] = _join_entities(result_entities)
+    blocks.extend(_relation_blocks(result_relations))
+    return blocks
 
 
 @mcp.tool()
-def open_nodes(names: list[str]) -> str:
+def open_nodes(names: list[str]) -> list[TextContent]:
     """Open specific nodes in the knowledge graph by their names.
 
-    Returns full entity details including all observations and timestamps.
+    Returns full entity details including all observations and timestamps
+    as discrete content blocks.
     """
     conn = _get_conn()
-    entities = []
+    blocks: list[TextContent] = []
 
     for name in names:
         row = conn.execute(
@@ -431,22 +502,27 @@ def open_nodes(names: list[str]) -> str:
         if not row:
             continue
 
-        entities.append({
-            "name": row["name"],
-            "entityType": row["entity_type"],
-            "observations": _get_obs_by_entity_id(conn, row["id"]),
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-        })
+        blocks.extend(
+            _entity_blocks(
+                row["name"],
+                row["entity_type"],
+                _get_obs_by_entity_id(conn, row["id"]),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+        )
 
-    return json.dumps({"entities": entities})
+    if not blocks:
+        return [TextContent(type="text", text="No entities found.")]
+    return blocks
 
 
 @mcp.tool()
-def read_graph() -> str:
+def read_graph() -> list[TextContent]:
     """Read the entire knowledge graph.
 
-    Returns all entities with observations and all relations.
+    Returns all entities with observations and all relations as discrete
+    content blocks.
     Note: loads the full graph into memory — may be large.
     """
     conn = _get_conn()
@@ -467,7 +543,11 @@ def read_graph() -> str:
             "relationType": row["relation_type"],
         })
 
-    return json.dumps({"entities": entities, "relations": relations})
+    blocks: list[TextContent] = _join_entities(entities)
+    blocks.extend(_relation_blocks(relations))
+    if not blocks:
+        return [TextContent(type="text", text="Knowledge graph is empty.")]
+    return blocks
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +555,7 @@ def read_graph() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def traverse(start_node: str, depth: int = 1) -> str:
+def traverse(start_node: str, depth: int = 1) -> list[TextContent]:
     """Traverse the graph from a starting node, returning all entities within N hops.
 
     Args:
@@ -486,7 +566,7 @@ def traverse(start_node: str, depth: int = 1) -> str:
 
     row = conn.execute("SELECT name FROM entities WHERE name = ?", (start_node,)).fetchone()
     if not row:
-        return json.dumps({"error": f"Entity not found: {start_node}", "entities": [], "relations": []})
+        return [TextContent(type="text", text=f"Entity not found: {start_node}")]
 
     depth = max(1, min(depth, 3))
     visited: set[str] = {start_node}
@@ -552,16 +632,14 @@ def traverse(start_node: str, depth: int = 1) -> str:
             "observations": _get_obs_by_entity_id(conn, erow["id"]),
         })
 
-    return json.dumps({
-        "entities": entities,
-        "relations": all_relations,
-        "hops": depth,
-        "nodes_found": len(entities),
-    })
+    blocks: list[TextContent] = _join_entities(entities)
+    blocks.extend(_relation_blocks(all_relations))
+    blocks.append(TextContent(type="text", text=f"Hops: {depth}, Nodes found: {len(entities)}"))
+    return blocks
 
 
 @mcp.tool()
-def recent(hours: int = 24) -> str:
+def recent(hours: int = 24) -> list[TextContent]:
     """Return entities, relations, and observations created or updated in the last N hours.
 
     Args:
@@ -599,16 +677,14 @@ def recent(hours: int = 24) -> str:
             "created_at": row["created_at"],
         })
 
-    return json.dumps({
-        "entities": entities,
-        "relations": relations,
-        "window_hours": hours,
-        "cutoff": cutoff_iso,
-    })
+    blocks: list[TextContent] = _join_entities(entities)
+    blocks.extend(_relation_blocks(relations))
+    blocks.append(TextContent(type="text", text=f"Window: {hours}h since {cutoff_iso}"))
+    return blocks
 
 
 @mcp.tool()
-def search_similar(name: str, threshold: float = 0.3) -> str:
+def search_similar(name: str, threshold: float = 0.3) -> list[TextContent]:
     """Fuzzy search for entity names using trigram similarity.
 
     Args:
@@ -627,14 +703,20 @@ def search_similar(name: str, threshold: float = 0.3) -> str:
 
     scored.sort(key=lambda x: -x[2])
 
-    return json.dumps({
-        "query": name,
-        "threshold": threshold,
-        "matches": [
-            {"name": s[0], "entityType": s[1], "score": round(s[2], 3)}
-            for s in scored[:20]
-        ],
-    })
+    if not scored:
+        return [TextContent(type="text", text=f"No similar entities found for '{name}'.")]
+
+    blocks = [
+        TextContent(type="text", text=f"Similar to '{name}' (threshold={threshold}):")
+    ]
+    blocks.extend(
+        TextContent(
+            type="text",
+            text=f"Match: {s[0]} ({s[1]}) score={round(s[2], 3)}",
+        )
+        for s in scored[:20]
+    )
+    return blocks
 
 
 # ---------------------------------------------------------------------------
